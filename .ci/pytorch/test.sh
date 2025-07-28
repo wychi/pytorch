@@ -1672,7 +1672,12 @@ elif [[ "${TEST_CONFIG}" == verify_cachebench ]]; then
 elif [[ "${TEST_CONFIG}" == *torchbench* ]]; then
   install_torchaudio
   install_torchvision
-  install_torchao
+  # commenting out torchao as its not needed for torchbench pt2 runs
+  if [[ "${TEST_CONFIG}" != *inductor* ]]; then
+    install_torchao
+  else;
+    pip_uninstall torchao
+  fi
   id=$((SHARD_NUMBER-1))
   # https://github.com/opencv/opencv-python/issues/885
   pip_install opencv-python==4.8.0.74
