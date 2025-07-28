@@ -21,6 +21,9 @@ __all__ = ["GraphTransformObserver"]
 class GraphTransformObserver:
     __pass_count = 0
 
+    # used to avoid register duplicated hooks on nodes
+    _hook_refcount: dict[int, int] = {}
+
     def __init__(
         self,
         gm: GraphModule,
@@ -102,10 +105,14 @@ class GraphTransformObserver:
     def __enter__(self):
         if not self.active:
             return self
-        self.gm._register_create_node_hook(self._node_creation_hook)
-        self.gm._register_erase_node_hook(self._node_erase_hook)
-        self.gm._register_replace_node_hook(self._node_replace_hook)
-        self.gm._register_deepcopy_hook(self._deepcopy_hook)
+        gm_id = id(self.gm)
+        GraphTransformObserver._hook_refcount.setdefault(gm_id, 0)
+        if GraphTransformObserver._hook_refcount[gm_id] == 0:
+            self.gm._register_create_node_hook(self._node_creation_hook)
+            self.gm._register_erase_node_hook(self._node_erase_hook)
+            self.gm._register_replace_node_hook(self._node_replace_hook)
+            self.gm._register_deepcopy_hook(self._deepcopy_hook)
+        GraphTransformObserver._hook_refcount[gm_id] += 1
 
         self.erased_nodes.clear()
         self.created_nodes.clear()
@@ -120,11 +127,17 @@ class GraphTransformObserver:
     def __exit__(self, type, value, tb):
         if not self.active:
             return
-        for gm in self.copied_gms + [self.gm]:
-            gm._unregister_create_node_hook(self._node_creation_hook)
-            gm._unregister_erase_node_hook(self._node_erase_hook)
-            gm._unregister_replace_node_hook(self._node_replace_hook)
-            gm._unregister_deepcopy_hook(self._deepcopy_hook)
+
+        gm_id = id(self.gm)
+        GraphTransformObserver._hook_refcount[gm_id] -= 1
+
+        if GraphTransformObserver._hook_refcount[gm_id] == 0:
+            for gm in self.copied_gms + [self.gm]:
+                gm._unregister_create_node_hook(self._node_creation_hook)
+                gm._unregister_erase_node_hook(self._node_erase_hook)
+                gm._unregister_replace_node_hook(self._node_replace_hook)
+                gm._unregister_deepcopy_hook(self._deepcopy_hook)
+            del GraphTransformObserver._hook_refcount[gm_id]
 
         if self.log_url is None:
             return
@@ -191,6 +204,12 @@ class GraphTransformObserver:
                 return
 
             assert isinstance(new_node, Node)
+
+            # replace hook is called once for each user of old
+            # this avoids adding duplicated source nodes
+            added_nodes = {s.name for s in new_node.meta.get("from_node", [])}
+            if old.name in added_nodes:
+                return
 
             action = [NodeSourceAction.REPLACE]
             if new_node.name in self.created_nodes:
