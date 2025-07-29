@@ -294,13 +294,13 @@ static PoolSizes process_pool_sizes(const Tensor& input,
               pooling_dims,
               " ints");
 
-  TORCH_CHECK(stride.empty() || stride.size() == 1 || stride.size() == 3,
+  TORCH_CHECK(stride.empty() || stride.size() == 1 || stride.size() == pooling_dims,
               op_name,
               ": stride must either be omitted, a single int, or a tuple of ",
               pooling_dims,
               " ints");
 
-  TORCH_CHECK(padding.size() == 1 || padding.size() == 3,
+  TORCH_CHECK(padding.size() == 1 || padding.size() == pooling_dims,
               op_name,
               ": padding must either be a single int, or a tuple of ",
               pooling_dims,
@@ -328,6 +328,22 @@ static PoolSizes process_pool_sizes(const Tensor& input,
     TORCH_CHECK(padding_expanded[dim] * 2 <= kernel_size_expanded[dim],
                 op_name,
                 ": pad should be at most half of effective kernel size");
+  }
+
+  if (pooling_dims == 2) {
+    const auto memory_format = input.suggest_memory_format();
+    bool valid_dims = input.size(1) != 0 && input.size(2) != 0;
+    if (memory_format == at::MemoryFormat::ChannelsLast) {
+      // Expect tensor in NHWC format and allow 0-dim only for N.
+      TORCH_CHECK((dims == 4 && valid_dims && input.size(3) != 0),
+                  "Expected 4D (batch mode) tensor expected for input with channels_last layout"
+                  " with optional 0 dim batch size for input, but got: ",
+                  input.sizes());
+    } else {
+      TORCH_CHECK((dims == 3 && input.size(0) != 0 && valid_dims) || (dims == 4 && valid_dims && input.size(3) != 0),
+                  "Expected 3D or 4D (batch mode) tensor with optional 0 dim batch size for input, but got:",
+                  input.sizes());
+    }
   }
 
   for (const auto dim : c10::irange(static_cast<int>(leading_dims == 2), dims)) {
@@ -678,6 +694,21 @@ Tensor mps_max_pool2d(const Tensor& input,
                       IntArrayRef dilation,
                       bool ceil_mode) {
   Tensor output = at::empty({0}, input.options(), MemoryFormat::Contiguous);
+#if !defined(__MAC_14_0) && (!defined(MAC_OS_X_VERSION_14_0) || (MAC_OS_X_VERSION_MIN_REQUIRED < MAC_OS_X_VERSION_14_0))
+  if (input.scalar_type() == c10::kByte) {
+    mps::max_pool_with_indices_out_mps_template(output,
+                                                std::nullopt,
+                                                input,
+                                                kernel_size,
+                                                stride,
+                                                padding,
+                                                dilation,
+                                                ceil_mode,
+                                                /*pooling_dims=*/2,
+                                                "max_pool2d");
+    return output;
+  }
+#endif
   mps::PoolingOpBlock pooling_op_block = ^PoolingOpFn(cachedGraph, desc) {
     MPSGraph* mpsGraph = cachedGraph.graph();
     return [mpsGraph maxPooling2DWithSourceTensor:cachedGraph.inputTensor descriptor:desc name:nil];
@@ -695,7 +726,6 @@ Tensor mps_max_pool2d(const Tensor& input,
                        std::nullopt,
                        pooling_op_block,
                        "max_pool2d");
-
   return output;
 }
 
@@ -740,6 +770,22 @@ TORCH_IMPL_FUNC(max_pool2d_with_indices_out_mps)
  bool ceil_mode,
  const Tensor& output,
  const Tensor& indices) {
+#if !defined(__MAC_14_0) && (!defined(MAC_OS_X_VERSION_14_0) || (MAC_OS_X_VERSION_MIN_REQUIRED < MAC_OS_X_VERSION_14_0))
+  if (input.scalar_type() == at::kByte) {
+    mps::max_pool_with_indices_out_mps_template(output,
+                                                indices,
+                                                input,
+                                                kernel_size,
+                                                stride,
+                                                padding,
+                                                dilation,
+                                                ceil_mode,
+                                                /*pooling_dims=*/2,
+                                                "max_pool2d");
+
+    return;
+  }
+#endif
   auto indices_memory_format = indices.suggest_memory_format();
 
   mps::PoolingOpBlock pooling_op_block = ^PoolingOpFn(cachedGraph, desc) {
