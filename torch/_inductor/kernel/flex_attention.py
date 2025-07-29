@@ -18,6 +18,7 @@ from torch.utils._ordered_set import OrderedSet
 from torch.utils._pytree import tree_map
 from torch.utils._sympy.numbers import int_oo
 from torch.utils._sympy.value_ranges import ValueRanges
+from ..kernel.flex_flash import CUTE_AVAILABLE
 
 from ..ir import (
     Buffer,
@@ -844,6 +845,20 @@ def _use_flex_decoding(query, kv_indices, kernel_options, enable_gqa):
     )
 
 
+def _use_flash_attention(subgraph: Subgraph, mask_graph: Subgraph) -> bool:
+    """Decide if we can use the flash attention external kernel.
+    For now, this is a trivial check - we can use flash attention if:
+    - No score_mod (subgraph is None)
+    - No mask_mod (mask_graph is None)
+    - CUTE flash attention is available
+    """
+    return (
+        CUTE_AVAILABLE
+        and subgraph.graph is None
+        and mask_graph.graph is None
+    )
+
+
 class Mode(Enum):
     fwd = auto()
     bwd = auto()
@@ -1275,7 +1290,6 @@ def flex_attention(
             score_mod_other_buffers,
             mask_mod_other_buffers,
         )
-
     # below is cuda path if device is not cpu
     # tl.dot does not support embedding size less than 16
     small_dqk = V.graph.sizevars.evaluate_expr(sympy.Lt(query.get_size()[-1], 16))
@@ -1352,6 +1366,22 @@ def flex_attention(
             score_mod_other_buffers,
             mask_mod_other_buffers,
         )
+    # Check if we can use flash attention external kernel
+    breakpoint()
+    if _use_flash_attention(subgraph, mask_graph):
+        from .flex_flash import FlashAttentionExternKernelChoice
+        from ..select_algorithm import ExternKernelCaller
+
+        # Create ExternKernelCaller for the flash attention kernel
+        input_nodes = [query, key, value]
+        layout = query.get_layout()  # Use query layout as template
+        kernel_caller = ExternKernelCaller(
+            FlashAttentionExternKernelChoice,
+            input_nodes,
+            layout,
+            kwargs={"scale": scale},
+        )
+        return kernel_caller.output_node()
 
     (
         query,
