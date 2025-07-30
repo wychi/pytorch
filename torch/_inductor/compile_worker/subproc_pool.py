@@ -15,12 +15,12 @@ from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from enum import Enum, IntEnum
 from typing import Any, Callable, IO, Optional, TypeVar
-from typing_extensions import Never, ParamSpec
 
 # _thread_safe_fork is needed because the subprocesses in the pool can read
 # justknobs, e.g., in the Triton compiler. For internal, the import installs
 # functionality to destroy singletons before forking and re-enable them after.
 import torch._thread_safe_fork  # noqa: F401
+from aiplatform.runtime_environment.runtime_environment_pybind import RuntimeEnvironment
 from torch._inductor import config
 from torch._inductor.codecache import torch_key
 from torch._inductor.compile_worker.tracked_process_pool import (
@@ -28,6 +28,7 @@ from torch._inductor.compile_worker.tracked_process_pool import (
 )
 from torch._inductor.compile_worker.utils import _async_compile_initializer
 from torch._inductor.utils import get_ld_library_path
+from typing_extensions import Never, ParamSpec
 
 
 log = logging.getLogger(__name__)
@@ -133,6 +134,14 @@ class SubprocPool:
         self.write_pipe = os.fdopen(write_fd, "wb")
         self.read_pipe = os.fdopen(read_fd, "rb")
         torch_key_str = base64.b64encode(torch_key()).decode("utf-8")
+        
+        mast_job_id = os.environ.get("MAST_HPC_JOB_NAME", None)
+        runtime_env: RuntimeEnvironment = RuntimeEnvironment()
+        global_rank = runtime_env.get_role_rank()
+        log_file = None
+        if mast_job_id is not None:
+            log_loc =  f"/logs/dedicated_log_rank{global_rank}"
+            log_file = open(log_loc, 'w')
 
         cmd = [
             sys.executable,
@@ -149,24 +158,28 @@ class SubprocPool:
         if config.worker_suppress_logging:
             log.info("Suppressing compile worker output due to config")
             local = True
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                env={
+                    **os.environ,
+                    # We need to set the PYTHONPATH so the subprocess can find torch.
+                    "PYTHONPATH": os.environ.get(
+                        "TORCH_CUSTOM_PYTHONPATH", os.pathsep.join(sys.path)
+                    ),
+                    # Safeguard against creating a SubprocPool in the subprocess.
+                    "TORCH_WARM_POOL": "0",
+                    # Some internal usages need a modified LD_LIBRARY_PATH.
+                    "LD_LIBRARY_PATH": get_ld_library_path(),
+                },
+                pass_fds=(subproc_read_fd, subproc_write_fd),
+                stdout=log_file if log_file else (subprocess.DEVNULL if local else None),
+                stderr=log_file if log_file else (subprocess.DEVNULL if local else None),
+            )
+        finally:
+            if log_file:
+                log_file.close()
 
-        self.process = subprocess.Popen(
-            cmd,
-            env={
-                **os.environ,
-                # We need to set the PYTHONPATH so the subprocess can find torch.
-                "PYTHONPATH": os.environ.get(
-                    "TORCH_CUSTOM_PYTHONPATH", os.pathsep.join(sys.path)
-                ),
-                # Safeguard against creating a SubprocPool in the subprocess.
-                "TORCH_WARM_POOL": "0",
-                # Some internal usages need a modified LD_LIBRARY_PATH.
-                "LD_LIBRARY_PATH": get_ld_library_path(),
-            },
-            pass_fds=(subproc_read_fd, subproc_write_fd),
-            stdout=subprocess.DEVNULL if local else None,
-            stderr=subprocess.DEVNULL if local else None,
-        )
         self.write_lock = threading.Lock()
         self.read_thread = threading.Thread(
             target=self._read_thread, name="InductorSubproc", daemon=True
