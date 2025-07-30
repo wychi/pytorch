@@ -920,8 +920,8 @@ cc_library(
         "test/cpp/common/support.h",
     ],
     deps = [
-        ":torch",
         "@com_google_googletest//:gtest_main",
+        ":torch",
     ],
 )
 
